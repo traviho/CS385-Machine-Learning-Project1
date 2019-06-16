@@ -1,11 +1,18 @@
 import cv2
 import numpy as np
 import math
+import json
+from skimage.feature import hog
 
 #### Cropping functions ####
 
 BOUNDING_BOX_FACTOR = 4/3
 RESIZE_IMG_SIZE = (96, 96)
+
+NUMBER_OF_BINS = 9
+CELL_SIZE = (16, 16)
+BLOCK_SIZE = (2, 2)
+count = 0
 
 def crop_image(img, x1, y1, x2, y2):
 	# (x1, y1) is top-left corner of where image should be cropped, relative to (0, 0). (x2, y2) is right-bottom corner.
@@ -42,47 +49,50 @@ def resize_img_with_values(img, center_x, center_y, radius_x, radius_y):
 	resized_radius_y = math.floor(y_ratio * radius_y)
 	return (resized_img, resized_center_x, resized_center_y, resized_radius_x, resized_radius_y)
 
-def gen_postive_img(img, center_x, center_y, radius_x, radius_y):
+def HOG_vector(img):
+	fd, _ = hog(img, orientations=NUMBER_OF_BINS, pixels_per_cell=CELL_SIZE,
+                    cells_per_block=BLOCK_SIZE, visualize=True, multichannel=True)
+	return fd
+
+def gen_postive_feature(img, center_x, center_y, radius_x, radius_y):
 	(x1, y1), (x2, y2) = bounding_box(center_x, center_y, radius_x, radius_y)
-	return crop_image(img, x1, y1, x2, y2)
+	cropped_img = crop_image(img, x1, y1, x2, y2)
+	resized_img = cv2.resize(cropped_img, RESIZE_IMG_SIZE)
+	return HOG_vector(resized_img)
 
-# returns 8 images sliding around bounding box
-def sliding_boxes(img, radius_x, radius_y):
-	box_width = radius_x * 2 # width & height of original bounding box, without the bounding box factor
-	box_height = radius_x * 2
-	x1, y1 = (0, 0)
-	x2, y2 = (img.shape[1], img.shape[0])
-	center_x = math.floor(x2 / 2)
-	center_y = math.floor(y2 / 2)
-	unbounded_x1, unbounded_y1 = center_x - radius_x, center_y - radius_y # x1, y1 point of inner-bounding box (without factor)
+# slides 8 64x64 images around a presumably 96x96 positive sample. Scales back up to 96.
+def sliding_boxes_feature_64(img):
+	sliding_size = (64, 64)
+	x_bound = img.shape[1] - sliding_size[1]
+	y_bound = img.shape[0] - sliding_size[0]
+	x_step = math.ceil(x_bound / 3)
+	y_step = math.ceil(y_bound / 3)
+	sliding_boxes = []
+	box_number = 0
+	for r in range(0, y_bound, y_step):
+		for c in range(0, x_bound, x_step):
+			if (box_number != 4):
+				cropped_img = img[r:r + sliding_size[1], c: c + sliding_size[0]]
+				resized_img = cv2.resize(cropped_img, RESIZE_IMG_SIZE)
+				feature_vector = HOG_vector(resized_img)
+				sliding_boxes.append(feature_vector)
+			box_number += 1
+	return sliding_boxes
 
-	neg_1 = img[y1:y1 + box_height, x1: x1 + box_width]
-	neg_2 = img[y1:y1 + box_height, unbounded_x1: unbounded_x1 + box_width]
-	neg_3 = img[y1:y1 + box_height, x2 - box_width: x2]
-
-	neg_4 = img[unbounded_y1:unbounded_y1 + box_height, x1:x1 + box_width]
-	neg_5 = img[unbounded_y1:unbounded_y1 + box_height, x2 - box_width: x2]
-
-	neg_6 = img[y2 - box_height:y2, x1:x1 + box_width]
-	neg_7 = img[y2 - box_height:y2, unbounded_x1: unbounded_x1 + box_width]
-	neg_8 = img[y2 - box_height:y2, x2 - box_width: x2]
-	return [neg_1, neg_2, neg_3, neg_4, neg_5, neg_6, neg_7, neg_8]
-
-def gen_negative_images(img, center_x, center_y, radius_x, radius_y):
-	resized_img, resized_center_x, resized_center_y, resized_radius_x, resized_radius_y = resize_img_with_values(img, center_x, center_y, radius_x, radius_y)
-	(x1, y1), (x2, y2) = bounding_box(resized_center_x, resized_center_y, resized_radius_x, resized_radius_y)
-	cropped_img = crop_image(resized_img, x1, y1, x2, y2)
-	return sliding_boxes(cropped_img, resized_radius_x, resized_radius_y)
+def gen_negative_features(img, center_x, center_y, radius_x, radius_y):
+	global count
+	count += 8
+	return sliding_boxes_feature_64(img)
 
 def gen_data_with_labels(face_data_arr, gen_negatives=False):
 	X_data = []
 	Y_data = []
 	for face_data in face_data_arr:
-		X_data.append(gen_postive_img(*face_data))
+		X_data.append(gen_postive_feature(*face_data))
 		Y_data.append(1)
 		if (gen_negatives):
-			X_data += gen_negative_images(*face_data)
-			Y_data += [-1] * 8
+			X_data += gen_negative_features(*face_data)
+			Y_data += [0] * 8
 	return (X_data, Y_data)
 
 #### File I/O functions ####
@@ -125,6 +135,12 @@ def read_ellipse_text_in_range(interval, folder_path, image_path):
 
 #### Create dataset using cropping + File I/O functions ####
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
+
 # Arbitrary dataset where first 4 folders (pos + neg), first 8 train, last 2 test, last 1 (pos + neg)
 def create_data():
 	X_train, Y_train, X_test, Y_test = [], [], [], []
@@ -132,6 +148,11 @@ def create_data():
 	face_data_arr_2 = read_ellipse_text_in_range((5, 9), FOLDER_PATH, IMAGE_PATH) # positives & negatives
 	face_data_arr_3 = read_ellipse_text_in_range((9, 10), FOLDER_PATH, IMAGE_PATH) # positives
 	face_data_arr_4 = read_ellipse_text_in_range((10, 11), FOLDER_PATH, IMAGE_PATH) # positives & negatives
+
+	# face_data_arr_1 = read_ellipse_text_in_range((1, 2), FOLDER_PATH, IMAGE_PATH) # positives
+	# face_data_arr_2 = read_ellipse_text_in_range((5, 6), FOLDER_PATH, IMAGE_PATH) # positives & negatives
+	# face_data_arr_3 = read_ellipse_text_in_range((9, 10), FOLDER_PATH, IMAGE_PATH) # positives
+	# face_data_arr_4 = read_ellipse_text_in_range((10, 11), FOLDER_PATH, IMAGE_PATH) # positives & negatives
 
 	# TODO: Adding two tuples (l1, l2) + (l3, l4) -> (l1 + l3, l2 + l4) more concise?
 	X_train, Y_train = gen_data_with_labels(face_data_arr_1)
@@ -146,13 +167,47 @@ def create_data():
 
 	return (X_train, Y_train, X_test, Y_test)
 
-#### Tests ####
+# JSON save & load
+FILE_NAME = "data_full.json"
 
-# X_train, Y_train, X_test, Y_test = create_data()
-# print(len(X_train))
-# print(len(Y_train))
+def save_dataset(filename=FILE_NAME):
+	X_train, Y_train, X_test, Y_test = create_data()
+	data_obj = {
+		"X_train": X_train,
+		"Y_train": Y_train,
+		"X_test": X_test,
+		"Y_test": Y_test
+	}
+	with open(filename, 'w') as f:  # writing JSON object
+		json.dump(data_obj, f, cls=NumpyEncoder)
 
-# print(len(X_test))
+def load_data(filename=FILE_NAME):
+	X_train, Y_train, X_test, Y_test = [], [], [], []
+	with open(filename) as f:
+		data_dict = json.load(f)
+		X_train_raw = data_dict["X_train"]
+		Y_train_raw = data_dict["Y_train"]
+		X_test_raw = data_dict["X_test"]
+		Y_test_raw = data_dict["Y_test"]
+
+		X_train = np.array(X_train_raw)
+		Y_train = np.array(Y_train_raw).reshape(len(Y_train_raw), 1)
+		X_test = np.array(X_test_raw)
+		Y_test = np.array(Y_test_raw).reshape(len(Y_test_raw), 1)
+	return (X_train, Y_train, X_test, Y_test)
+
+# face_data_arr_1 = read_ellipse_text_in_range((1, 5), FOLDER_PATH, IMAGE_PATH) # positives
+# face_data_arr_2 = read_ellipse_text_in_range((5, 9), FOLDER_PATH, IMAGE_PATH)
+# _, Y_train = gen_data_with_labels(face_data_arr_1)
+# _, Y_train_add = gen_data_with_labels(face_data_arr_2, True)
+# Y_train += Y_train_add
+
+# face_data_arr_3 = read_ellipse_text_in_range((9, 10), FOLDER_PATH, IMAGE_PATH) # positives
+# face_data_arr_4 = read_ellipse_text_in_range((10, 11), FOLDER_PATH, IMAGE_PATH) # positives & negatives
+
+# _, Y_test = gen_data_with_labels(face_data_arr_3)
+# _, Y_test_add = gen_data_with_labels(face_data_arr_4, True)
+# Y_test += Y_test_add
+
 # print(len(Y_test))
-# cv2.imshow('image', X_train[8])
-# cv2.waitKey(0)
+# print(count)

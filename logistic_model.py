@@ -45,7 +45,7 @@ class LogisticModel:
         return w - (learning_rate * dw)
 
     # for each epoch, update w and print cost
-    def batch_gradient(self, X, Y, m, w, epochs=1000, learning_rate=0.5):
+    def batch_gradient(self, X, Y, m, w, epochs=100, learning_rate=0.5):
         costs = []
         for _ in range(epochs):
             A = self.activation(w, X)
